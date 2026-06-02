@@ -1,0 +1,11 @@
+Mảng có 5 phần tử, tổng = 150
+Số chẵn 0..=10: 0 2 4 6 8 10 
+7 là số lẻ
+min(3,9)=3, max(3,9)=9, abs(-42)=42
+PI ≈ 3.14159, chu vi r=2 là 12.5664
+gcd(48,36)=12, is_prime(97)=true, 2^10=1024
+5! = 120
+Điểm 8 -> Khá
+'tue' -> Thứ Ba
+Đếm tới 5 bằng loop
+assert OK!

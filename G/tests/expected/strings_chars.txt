@@ -1,0 +1,5 @@
+G	lang
+char A = mã 65
+hex 0xFF=255, bin 0b1010=10, oct 0o17=15
+i64 lớn = 1000000000000
+not true = false

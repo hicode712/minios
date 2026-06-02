@@ -1,0 +1,12 @@
+=== Ngôn ngữ G ===
+Điểm p = (3, 4)
+square(5) = 25
+Tổng 1..5 = 15
+classify(0) = không
+classify(1) = một
+classify(2) = nhiều
+Giá trị qua con trỏ = 100
+Color Green = 1
+add_asm(20, 22) = 42
+[defer] dọn dẹp xong
+[defer] tạm biệt!

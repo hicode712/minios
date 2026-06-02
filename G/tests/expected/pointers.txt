@@ -1,0 +1,2 @@
+sau swap: a=99, b=1
+tổng buffer = 100

@@ -1,0 +1,12 @@
+# Build artifacts của G
+__pycache__/
+*.pyc
+*.out
+*.o
+*.c
+
+# File thực thi sinh ra từ examples / tests (không có đuôi .g)
+examples/*
+!examples/*.g
+tests/cases/*
+!tests/cases/*.g

@@ -1,0 +1,4 @@
+Diện tích = 12
+Vuông? false
+Sau scale(2): 6x8, diện tích = 48
+s vuông? true
