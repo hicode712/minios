@@ -12,7 +12,8 @@ from typing import Optional
 class Type:
     name: str                      # int, f64, str, void, tên struct/enum...
     ptr: int = 0                   # số mức con trỏ (*)
-    array: Optional[object] = None # nếu là mảng: số phần tử (int) hoặc None cho [ ]T
+    array: Optional[object] = None # mảng 1 chiều: số phần tử (int) / "dyn" cho []T
+    dims: Optional[list] = None    # mảng nhiều chiều: [d0, d1, ...] (mỗi d là int/"dyn")
     line: int = 0
     col: int = 0
 
@@ -83,6 +84,7 @@ class Let:
     type: Optional[Type]
     value: object
     mutable: bool
+    c_name: str = ""        # tên C duy nhất (do checker cấp, hỗ trợ shadowing)
     line: int = 0
     col: int = 0
 
@@ -126,6 +128,7 @@ class For:                  # for i in a..b { } | a..=b | step N
     body: list
     inclusive: bool = False
     step: object = None
+    c_name: str = ""
     line: int = 0
     col: int = 0
 
@@ -135,6 +138,8 @@ class ForEach:             # for x in iterable { }   (mảng tĩnh hoặc str)
     var: str
     iterable: object
     body: list
+    mutable: bool = False  # for mut x in ... : cho phép sửa biến lặp
+    c_name: str = ""
     line: int = 0
     col: int = 0
 
@@ -159,13 +164,22 @@ class Asm:
 
 
 @dataclass
+class Block:                # khối lệnh trần { ... } (tạo scope mới)
+    body: list
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
 class Break:
-    pass
+    line: int = 0
+    col: int = 0
 
 
 @dataclass
 class Continue:
-    pass
+    line: int = 0
+    col: int = 0
 
 
 @dataclass
@@ -234,6 +248,7 @@ class ArrayLit:
 @dataclass
 class Ident:
     name: str
+    c_name: str = ""        # tên C đã phân giải (hỗ trợ shadowing); rỗng = dùng name
     line: int = 0
     col: int = 0
 
@@ -309,6 +324,13 @@ class Cast:
 @dataclass
 class SizeOf:
     type: Type
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
+class SizeOfExpr:          # sizeof(biểu_thức) — lấy kích thước theo kiểu suy luận
+    expr: object
     line: int = 0
     col: int = 0
 

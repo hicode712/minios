@@ -33,7 +33,7 @@ class Codegen:
         self.indent = 0
         self.struct_names = set()
         self.enum_names = set()
-        self.defers = []
+        self.scope_stack = []   # ngăn xếp scope cho defer (LIFO, theo block)
         self._tmp = 0
 
     # ---------- tiện ích ----------
@@ -45,26 +45,93 @@ class Codegen:
         return f"{base}{self._tmp}"
 
     def c_type(self, t: A.Type) -> str:
+        """Kiểu cơ sở (gồm các mức con trỏ tường minh), KHÔNG gồm phần mảng."""
         base = TYPE_MAP.get(t.name, t.name)
         base += "*" * t.ptr
         return base
+
+    def _dims(self, t: A.Type) -> list:
+        """Chuẩn hóa danh sách chiều mảng từ A.Type (gộp dims/array)."""
+        if t.dims is not None:
+            return list(t.dims)
+        if t.array is not None:
+            return [t.array]
+        return []
+
+    def c_decl(self, name, t: A.Type, init_c=None, const=False, decay_first=False):
+        """Sinh khai báo C đầy đủ cho biến/trường/tham số, xử lý mảng nhiều chiều.
+        decay_first=True: chiều ngoài cùng phân rã thành con trỏ (quy tắc tham số C).
+
+        'const' đặt theo kiểu *east-const* (ngay trước tên) để bất biến áp lên
+        CHÍNH biến: 'int* const p' (con trỏ bất biến, '*p' vẫn ghi được) —
+        đúng ngữ nghĩa 'let' của G, khác hẳn 'const int* p' (cấm ghi '*p')."""
+        cv = self.c_type(t)
+        cq = "const " if const else ""   # đặt ngay trước định danh
+        dims = self._dims(t)
+        if decay_first and dims:
+            dims = ["dyn"] + dims[1:]   # tham số: [N]... -> con trỏ tới phần còn lại
+        # Tách run "dyn" dẫn đầu thành con trỏ; phần còn lại là mảng tĩnh.
+        nptr = 0
+        i = 0
+        while i < len(dims) and dims[i] == "dyn":
+            nptr += 1
+            i += 1
+        static_dims = dims[i:]
+        if any(d == "dyn" for d in static_dims):
+            # Chiều động xen giữa: phân rã toàn bộ thành con trỏ (mất kích thước tĩnh).
+            decl = f"{cv}{'*' * len(dims)} {cq}{name}"
+        elif nptr and static_dims:
+            arr = "".join(f"[{d}]" for d in static_dims)
+            decl = f"{cv} ({'*' * nptr}{cq}{name}){arr}"   # con trỏ tới mảng
+        elif nptr:
+            decl = f"{cv}{'*' * nptr} {cq}{name}"
+        elif static_dims:
+            arr = "".join(f"[{d}]" for d in static_dims)
+            decl = f"{cv} {cq}{name}{arr}"
+        else:
+            decl = f"{cv} {cq}{name}"
+        if init_c is not None:
+            decl += f" = {init_c}"
+        return decl
+
+    def c_param_type(self, t: A.Type) -> str:
+        # (giữ cho tương thích) — kiểu tham số đơn giản, mảng phân rã thành con trỏ.
+        base = self.c_type(t)
+        dims = self._dims(t)
+        if dims:
+            base += "*" * len(dims)
+        return base
+
+    def _has_call(self, e) -> bool:
+        """Biểu thức có chứa lời gọi hàm/method (tác dụng phụ)? — quyết định
+        có cần dùng statement-expression để tránh đánh giá hai lần hay không."""
+        if isinstance(e, A.Call):
+            return True
+        if isinstance(e, A.Binary):
+            return self._has_call(e.left) or self._has_call(e.right)
+        if isinstance(e, A.Unary):
+            return self._has_call(e.operand)
+        if isinstance(e, A.Ternary):
+            return any(self._has_call(x) for x in (e.cond, e.then, e.els))
+        if isinstance(e, A.Index):
+            return self._has_call(e.base) or self._has_call(e.index)
+        if isinstance(e, A.FieldAccess):
+            return self._has_call(e.base)
+        if isinstance(e, A.Cast):
+            return self._has_call(e.expr)
+        if isinstance(e, A.SizeOfExpr):
+            return self._has_call(e.expr)
+        if isinstance(e, A.ArrayLit):
+            return any(self._has_call(x) for x in e.elements)
+        if isinstance(e, A.StructLit):
+            return any(self._has_call(v) for _, v in e.fields)
+        return False
 
     def gtype_of(self, e) -> T.GType:
         return getattr(e, "gtype", T.UNKNOWN)
 
     def emit_var_decl(self, name, t: A.Type, init_c=None, const=False):
-        cv = self.c_type(t)
-        q = " const" if const else ""
-        if t.array == "dyn":
-            cv = cv + "*"   # []T -> con trỏ
-            decl = f"{cv}{q} {name}"
-        elif t.array is not None:
-            decl = f"{cv}{q} {name}[{t.array}]"
-        else:
-            decl = f"{cv}{q} {name}"
-        if init_c is not None:
-            decl += f" = {init_c}"
-        return decl + ";"
+        return self.c_decl(name, t, init_c, const=const) + ";"
 
     # ---------- điểm vào ----------
     def generate(self) -> str:
@@ -72,18 +139,31 @@ class Codegen:
         self.w('#include "g_runtime.h"')
         self.w("")
 
+        struct_defs = {}
         for it in self.prog.items:
             if isinstance(it, A.StructDef):
                 self.struct_names.add(it.name)
+                struct_defs[it.name] = it
             elif isinstance(it, A.EnumDef):
                 self.enum_names.add(it.name)
 
-        # 1) struct & enum
+        # 1a) enum trước (struct có thể nhúng enum theo giá trị)
         for it in self.prog.items:
-            if isinstance(it, A.StructDef):
-                self.gen_struct(it)
-            elif isinstance(it, A.EnumDef):
+            if isinstance(it, A.EnumDef):
                 self.gen_enum(it)
+
+        # 1b) Khai báo tiến (forward decl) MỌI struct: cho phép tự/đệ-quy tham
+        #     chiếu qua con trỏ (linked list) và tham chiếu lẫn nhau.
+        if struct_defs:
+            for it in self.prog.items:
+                if isinstance(it, A.StructDef):
+                    self.w(f"typedef struct {it.name} {it.name};")
+            self.w("")
+
+        # 1c) Định nghĩa struct theo thứ tự topo: struct nhúng struct khác THEO
+        #     GIÁ TRỊ phải đứng sau struct đó (trường con trỏ không tạo ràng buộc).
+        for name in self._topo_sort_structs(struct_defs):
+            self.gen_struct(struct_defs[name])
 
         # 2) biến toàn cục
         for it in self.prog.items:
@@ -115,13 +195,46 @@ class Codegen:
         return "\n".join(self.out)
 
     # ---------- struct / enum / global ----------
+    def _topo_sort_structs(self, struct_defs: dict) -> list:
+        """Sắp xếp topo theo phụ thuộc 'nhúng theo giá trị'. Trường con trỏ (*T)
+        KHÔNG tạo ràng buộc (forward decl là đủ). Chu trình theo-giá-trị là không
+        hợp lệ trong C; ta vẫn xuất phần còn lại để báo lỗi rõ ràng nếu có."""
+        deps = {name: set() for name in struct_defs}
+        for name, s in struct_defs.items():
+            for f in s.fields:
+                # phụ thuộc chỉ khi nhúng trực tiếp theo giá trị (ptr=0, không mảng-con-trỏ)
+                if f.type.ptr == 0 and f.type.name in struct_defs:
+                    deps[name].add(f.type.name)
+        order = []
+        done = set()
+        temp = set()
+
+        def visit(n):
+            if n in done:
+                return
+            if n in temp:        # chu trình theo giá trị — bỏ qua để C báo lỗi sau
+                return
+            temp.add(n)
+            for d in sorted(deps[n]):
+                visit(d)
+            temp.discard(n)
+            done.add(n)
+            order.append(n)
+
+        for name in struct_defs:           # giữ thứ tự khai báo ổn định
+            visit(name)
+        return order
+
     def gen_struct(self, s: A.StructDef):
-        self.w(f"typedef struct {s.name} {{")
+        # Struct rỗng không hợp lệ trong C chuẩn -> chèn trường đệm.
+        self.w(f"struct {s.name} {{")
         self.indent += 1
+        if not s.fields:
+            self.w("char _g_empty;")
         for f in s.fields:
             self.w(self.emit_var_decl(f.name, f.type))
         self.indent -= 1
-        self.w(f"}} {s.name};")
+        self.w("};")
         self.w("")
 
     def gen_enum(self, e: A.EnumDef):
@@ -150,7 +263,7 @@ class Codegen:
     def fn_signature(self, fn: A.Function) -> str:
         parts = []
         for p in fn.params:
-            parts.append(f"{self.c_type(p.type)} {p.name}")
+            parts.append(self.c_decl(p.name, p.type, decay_first=True))
         params = ", ".join(parts) if parts else "void"
         ret = self.c_type(fn.ret)
         qual = ""
@@ -162,27 +275,45 @@ class Codegen:
 
     def gen_fn(self, fn: A.Function):
         self.w(self.fn_signature(fn) + " {")
-        self.indent += 1
-        saved = self.defers
-        self.defers = []
-        for st in fn.body:
-            self.gen_stmt(st)
-        self.flush_defers()
-        self.defers = saved
-        self.indent -= 1
+        self.scope_stack = []
+        self.gen_scoped_body(fn.body, is_loop=False)
         self.w("}")
 
-    def flush_defers(self):
-        for d in reversed(self.defers):
-            self.gen_stmt(d, is_defer_flush=True)
+    # ---------- quản lý scope & defer (kiểu Zig, theo block, LIFO) ----------
+    def gen_scoped_body(self, body, is_loop=False, prologue=None):
+        """Sinh thân một block: mở scope defer, (tuỳ chọn) prologue, các lệnh,
+        rồi xả defer của scope này (nếu block không kết thúc bằng return/break/continue)."""
+        frame = {"defers": [], "is_loop": is_loop}
+        self.scope_stack.append(frame)
+        self.indent += 1
+        if prologue:
+            for line in prologue:
+                self.w(line)
+        for s in body:
+            self.gen_stmt(s)
+        if not (body and isinstance(body[-1], (A.Return, A.Break, A.Continue))):
+            self._flush_frame(frame)
+        self.indent -= 1
+        self.scope_stack.pop()
+
+    def _flush_frame(self, frame):
+        for d in reversed(frame["defers"]):
+            self.gen_stmt(d)
+
+    def _emit_exit_defers(self, kind):
+        """Xả defer khi rời hàm/vòng lặp: return xả mọi scope; break/continue
+        xả tới scope vòng lặp gần nhất (bao gồm chính nó)."""
+        for frame in reversed(self.scope_stack):
+            self._flush_frame(frame)
+            if kind != "return" and frame["is_loop"]:
+                break
 
     # ---------- câu lệnh ----------
-    def gen_stmt(self, st, is_defer_flush=False):
+    def gen_stmt(self, st):
         if isinstance(st, A.Let):
             self.gen_let(st)
         elif isinstance(st, A.Return):
-            for d in reversed(self.defers):
-                self.gen_stmt(d, is_defer_flush=True)
+            self._emit_exit_defers("return")
             if st.value is not None:
                 self.w(f"return {self.gen_expr(st.value)};")
             else:
@@ -191,26 +322,32 @@ class Codegen:
             self.gen_if(st)
         elif isinstance(st, A.While):
             self.w(f"while ({self.gen_expr(st.cond)}) {{")
-            self.gen_body(st.body)
+            self.gen_scoped_body(st.body, is_loop=True)
             self.w("}")
         elif isinstance(st, A.Loop):
             self.w("for (;;) {")
-            self.gen_body(st.body)
+            self.gen_scoped_body(st.body, is_loop=True)
             self.w("}")
         elif isinstance(st, A.For):
             self.gen_for(st)
+        elif isinstance(st, A.ForEach):
+            self.gen_foreach(st)
         elif isinstance(st, A.Match):
             self.gen_match(st)
+        elif isinstance(st, A.Block):
+            self.w("{")
+            self.gen_scoped_body(st.body, is_loop=False)
+            self.w("}")
         elif isinstance(st, A.Defer):
-            if is_defer_flush:
-                self.gen_stmt(st.stmt, is_defer_flush=True)
-            else:
-                self.defers.append(st.stmt)
+            # ghi nhận vào scope hiện tại; sẽ xả khi rời block (LIFO)
+            self.scope_stack[-1]["defers"].append(st.stmt)
         elif isinstance(st, A.Asm):
             self.gen_asm(st)
         elif isinstance(st, A.Break):
+            self._emit_exit_defers("break")
             self.w("break;")
         elif isinstance(st, A.Continue):
+            self._emit_exit_defers("continue")
             self.w("continue;")
         elif isinstance(st, A.Assign):
             self.w(f"{self.gen_expr(st.target)} {st.op} {self.gen_expr(st.value)};")
@@ -219,55 +356,126 @@ class Codegen:
         else:
             raise CodegenError(f"câu lệnh chưa hỗ trợ: {st}")
 
-    def gen_body(self, body):
-        self.indent += 1
-        for s in body:
-            self.gen_stmt(s)
-        self.indent -= 1
-
     def gen_let(self, st: A.Let):
         const = not st.mutable
-        # mảng literal: int a[N] = {...}
+        name = getattr(st, "c_name", st.name)
+        # ----- mảng literal (kể cả nhiều chiều): T name[..][..] = { ... } -----
         if isinstance(st.value, A.ArrayLit):
-            gt = self.gtype_of(st.value)
+            init = self.gen_array_init(st.value)
             if st.type is not None:
-                cv = self.c_type(A.Type(st.type.name, ptr=st.type.ptr))
-                n = st.type.array if st.type.array not in (None, "dyn") else len(st.value.elements)
+                ty = self._array_type_with_inferred_dims(st.type, st.value)
+                self.w(self.c_decl(name, ty, init, const=const) + ";")
             else:
-                cv = T.c_type(gt.elem) if gt.kind == "array" else "int"
-                n = len(st.value.elements)
-            init = "{ " + ", ".join(self.gen_expr(x) for x in st.value.elements) + " }"
-            q = "const " if const else ""
-            self.w(f"{q}{cv} {st.name}[{n}] = {init};")
+                gt = self.gtype_of(st.value)
+                ty = self._gtype_to_ctype_decl(gt)
+                self.w(self.c_decl(name, ty, init, const=const) + ";")
             return
 
         init_c = self.gen_expr(st.value) if st.value is not None else None
         if st.type is not None:
-            self.w(self.emit_var_decl(st.name, st.type, init_c, const=const))
+            self.w(self.c_decl(name, st.type, init_c, const=const) + ";")
         else:
             if init_c is None:
-                self.w(f"int {st.name};")
+                self.w(f"int {name};")
             else:
                 q = "const " if const else ""
-                self.w(f"{q}__auto_type {st.name} = {init_c};")
+                self.w(f"{q}__auto_type {name} = {init_c};")
+
+    def gen_array_init(self, lit: A.ArrayLit) -> str:
+        """Sinh initializer { ... } (đệ quy cho mảng lồng nhau)."""
+        parts = []
+        for x in lit.elements:
+            if isinstance(x, A.ArrayLit):
+                parts.append(self.gen_array_init(x))
+            else:
+                parts.append(self.gen_expr(x))
+        return "{ " + ", ".join(parts) + " }"
+
+    def _array_type_with_inferred_dims(self, decl_t: A.Type, lit: A.ArrayLit) -> A.Type:
+        """Điền các chiều mảng còn để trống bằng độ dài literal tương ứng."""
+        dims = self._dims(decl_t)
+        if not dims:
+            return decl_t
+        filled = []
+        node = lit
+        for d in dims:
+            if d in (None, "dyn"):
+                n = len(node.elements) if isinstance(node, A.ArrayLit) else 0
+                filled.append(n)
+            else:
+                filled.append(d)
+            node = node.elements[0] if (isinstance(node, A.ArrayLit) and node.elements) else None
+        return A.Type(decl_t.name, ptr=decl_t.ptr, dims=filled, array=filled[0])
+
+    def _gtype_to_ctype_decl(self, gt: T.GType) -> A.Type:
+        """Suy ra A.Type (cho c_decl) từ GType mảng đã suy luận (khi không có annotation)."""
+        dims = []
+        cur = gt
+        while cur is not None and cur.kind == "array":
+            dims.append(cur.n if cur.n is not None else "dyn")
+            cur = cur.elem
+        base = cur if cur is not None else T.INT
+        ptr = 0
+        while base.kind == "ptr":
+            ptr += 1
+            base = base.elem
+        name = base.name if base.name else base.kind
+        return A.Type(name, ptr=ptr, dims=dims or None,
+                      array=(dims[0] if dims else None))
 
     def gen_if(self, st: A.If):
         self.w(f"if ({self.gen_expr(st.cond)}) {{")
-        self.gen_body(st.then)
+        self.gen_scoped_body(st.then, is_loop=False)
         if st.els is not None:
             self.w("} else {")
-            self.gen_body(st.els)
+            self.gen_scoped_body(st.els, is_loop=False)
         self.w("}")
 
     def gen_for(self, st: A.For):
         start = self.gen_expr(st.start)
         end = self.gen_expr(st.end)
-        v = st.var
+        v = getattr(st, "c_name", "") or st.var
+        vt = getattr(st, "var_type", None)
+        ctype = T.c_type(vt) if vt is not None else "long"
         cmp = "<=" if st.inclusive else "<"
         step = f"{v} += {self.gen_expr(st.step)}" if st.step is not None else f"{v}++"
-        self.w(f"for (long {v} = {start}; {v} {cmp} {end}; {step}) {{")
-        self.gen_body(st.body)
+        self.w(f"for ({ctype} {v} = {start}; {v} {cmp} {end}; {step}) {{")
+        self.gen_scoped_body(st.body, is_loop=True)
         self.w("}")
+
+    def gen_foreach(self, st: A.ForEach):
+        var = getattr(st, "c_name", "") or st.var
+        elem_c = T.c_type(getattr(st, "elem_type", T.INT))
+        kind = getattr(st, "iter_kind", "array")
+        if kind == "str":
+            p = self.tmp("_gs")
+            src = self.gen_expr(st.iterable)
+            self.w(f"for (const char* {p} = ({src}); *{p}; ++{p}) {{")
+            self.gen_scoped_body(st.body, is_loop=True,
+                                 prologue=[f"{elem_c} {var} = *{p};"])
+            self.w("}")
+        else:  # mảng tĩnh: dùng sizeof để lấy độ dài
+            i = self.tmp("_gi")
+            if isinstance(st.iterable, A.ArrayLit):
+                # literal: vật hoá vào mảng tạm để sizeof hợp lệ
+                arr = self.tmp("_gar")
+                init = self.gen_array_init(st.iterable)
+                n = len(st.iterable.elements)
+                self.w(f"{{ {elem_c} {arr}[{n}] = {init};")
+                self.indent += 1
+                self.w(f"for (size_t {i} = 0; {i} < {n}; ++{i}) {{")
+                self.gen_scoped_body(st.body, is_loop=True,
+                                     prologue=[f"{elem_c} {var} = {arr}[{i}];"])
+                self.w("}")
+                self.indent -= 1
+                self.w("}")
+            else:
+                arr = self.gen_expr(st.iterable)
+                self.w(f"for (size_t {i} = 0; {i} < sizeof({arr}) / sizeof(({arr})[0]); "
+                       f"++{i}) {{")
+                self.gen_scoped_body(st.body, is_loop=True,
+                                     prologue=[f"{elem_c} {var} = ({arr})[{i}];"])
+                self.w("}")
 
     def gen_match(self, st: A.Match):
         subj_t = self.gtype_of(st.subject)
@@ -299,11 +507,11 @@ class Codegen:
             kw = "if" if first else "else if"
             first = False
             self.w(f"{kw} ({cond_for(pats)}) {{")
-            self.gen_body(body)
+            self.gen_scoped_body(body, is_loop=False)
             self.w("}")
         if default_body is not None:
             self.w("else {" if not first else "{")
-            self.gen_body(default_body)
+            self.gen_scoped_body(default_body, is_loop=False)
             self.w("}")
         self.indent -= 1
         self.w("}")
@@ -329,9 +537,17 @@ class Codegen:
         if isinstance(e, A.NullLit):
             return "NULL"
         if isinstance(e, A.Ident):
-            return e.name
+            return getattr(e, "c_name", "") or e.name
         if isinstance(e, A.Binary):
-            return f"({self.gen_expr(e.left)} {e.op} {self.gen_expr(e.right)})"
+            lc = self.gen_expr(e.left)
+            rc = self.gen_expr(e.right)
+            # Modulo số thực: C cấm '%' trên double -> dùng fmod().
+            if e.op == "%":
+                lt = self.gtype_of(e.left)
+                rt = self.gtype_of(e.right)
+                if lt.kind == "float" or rt.kind == "float":
+                    return f"fmod({lc}, {rc})"
+            return f"({lc} {e.op} {rc})"
         if isinstance(e, A.Unary):
             return f"({e.op}{self.gen_expr(e.operand)})"
         if isinstance(e, A.Ternary):
@@ -348,6 +564,8 @@ class Codegen:
             return f"(({self.c_type(e.type)})({self.gen_expr(e.expr)}))"
         if isinstance(e, A.SizeOf):
             return f"sizeof({self.c_type(e.type)})"
+        if isinstance(e, A.SizeOfExpr):
+            return f"sizeof({self.gen_expr(e.expr)})"
         if isinstance(e, A.ArrayLit):
             return "{ " + ", ".join(self.gen_expr(x) for x in e.elements) + " }"
         if isinstance(e, A.StructLit):
@@ -374,12 +592,32 @@ class Codegen:
                 msg = self.gen_expr(e.args[0]) if e.args else '"panic"'
                 return f"g_panic({msg})"
             if name in ("min", "max"):
-                a, b = self.gen_expr(e.args[0]), self.gen_expr(e.args[1])
                 op = "<" if name == "min" else ">"
-                return f"(({a}) {op} ({b}) ? ({a}) : ({b}))"
+                a, b = e.args[0], e.args[1]
+                ca, cb = self.gen_expr(a), self.gen_expr(b)
+                if self._has_call(a) or self._has_call(b):
+                    # có tác dụng phụ -> statement-expression, đánh giá đúng MỘT lần
+                    ta, tb = self.tmp("_ga"), self.tmp("_gb")
+                    return (f"({{ __auto_type {ta} = ({ca}); __auto_type {tb} = ({cb}); "
+                            f"({ta} {op} {tb}) ? {ta} : {tb}; }})")
+                return f"(({ca}) {op} ({cb}) ? ({ca}) : ({cb}))"
             if name == "abs":
-                a = self.gen_expr(e.args[0])
-                return f"(({a}) < 0 ? -({a}) : ({a}))"
+                a = e.args[0]
+                ca = self.gen_expr(a)
+                if self._has_call(a):
+                    ta = self.tmp("_ga")
+                    return f"({{ __auto_type {ta} = ({ca}); {ta} < 0 ? -{ta} : {ta}; }})"
+                return f"(({ca}) < 0 ? -({ca}) : ({ca}))"
+            if name == "clamp":
+                x, lo, hi = e.args[0], e.args[1], e.args[2]
+                cx, cl, ch = self.gen_expr(x), self.gen_expr(lo), self.gen_expr(hi)
+                if self._has_call(x) or self._has_call(lo) or self._has_call(hi):
+                    tx, tl, th = self.tmp("_gx"), self.tmp("_gl"), self.tmp("_gh")
+                    return (f"({{ __auto_type {tx} = ({cx}); __auto_type {tl} = ({cl}); "
+                            f"__auto_type {th} = ({ch}); "
+                            f"{tx} < {tl} ? {tl} : ({tx} > {th} ? {th} : {tx}); }})")
+                return (f"(({cx}) < ({cl}) ? ({cl}) : "
+                        f"(({cx}) > ({ch}) ? ({ch}) : ({cx})))")
             if name in ("g_alloc", "g_realloc"):
                 args = ", ".join(self.gen_expr(a) for a in e.args)
                 return f"{name}({args})"
@@ -389,10 +627,13 @@ class Codegen:
 
     def gen_len(self, e: A.Call):
         arg = e.args[0]
-        c = self.gen_expr(arg)
         gt = self.gtype_of(arg)
-        if gt.kind == "array":
-            return f"(sizeof({c}) / sizeof(({c})[0]))"
+        # Mảng literal: độ dài biết lúc biên dịch (sizeof trên '{...}' không hợp lệ).
+        if isinstance(arg, A.ArrayLit):
+            return str(len(arg.elements))
+        if gt.kind == "array" and gt.n not in (None, "dyn"):
+            return str(gt.n)
+        c = self.gen_expr(arg)
         if gt.kind == "str":
             return f"strlen({c})"
         return f"(sizeof({c}) / sizeof(({c})[0]))"
@@ -409,7 +650,7 @@ class Codegen:
         stream = "stderr" if name.startswith("e") else "stdout"
         newline = name.endswith("ln")
         if not e.args:
-            return f'fprintf({stream}, "{chr(92)}n")' if newline else f'fprintf({stream}, "")'
+            return f"fprintf({stream}, {self.c_string(chr(10) if newline else '')})"
         first = e.args[0]
         if isinstance(first, A.StrLit):
             template = first.value
@@ -417,21 +658,76 @@ class Codegen:
         else:
             template = "{}"
             value_args = e.args
-        fmt, c_args = self.build_format(template, value_args)
-        if newline:
-            fmt = fmt[:-1] + '\\n"'
+        fmt, c_args = self.build_format(template, value_args, newline)
         if c_args:
             return f"fprintf({stream}, {fmt}, {', '.join(c_args)})"
         return f"fprintf({stream}, {fmt})"
 
+    # key tường minh -> (specifier, kiểu_ép). Ép kiểu để specifier luôn KHỚP
+    # đối số trên mọi nền tảng (int64_t có thể là 'long' hoặc 'long long').
+    # Dùng biến thể 'll' cho hex/oct để không cắt cụt giá trị 64-bit.
     SPEC_MAP = {
-        "d": "%d", "ld": "%lld", "u": "%u", "lu": "%llu",
-        "f": "%g", "lf": "%lf", "e": "%e",
-        "s": "%s", "c": "%c", "x": "%x", "X": "%X",
-        "o": "%o", "p": "%p", "b": "%s",
+        "d":  ("%d",   "int"),
+        "ld": ("%lld", "long long"),
+        "u":  ("%u",   "unsigned"),
+        "lu": ("%llu", "unsigned long long"),
+        "f":  ("%g",   "double"),
+        "lf": ("%f",   "double"),
+        "g":  ("%g",   "double"),
+        "e":  ("%e",   "double"),
+        "s":  ("%s",   None),
+        "c":  ("%c",   "int"),
+        "x":  ("%llx", "unsigned long long"),
+        "X":  ("%llX", "unsigned long long"),
+        "o":  ("%llo", "unsigned long long"),
+        "p":  ("%p",   "void*"),
     }
 
-    def build_format(self, raw, value_args):
+    def _fmt_placeholder(self, key, arg):
+        """Trả về (specifier, c_arg | None) cho một placeholder, kèm ép kiểu
+        để printf luôn nhận đúng kiểu (an toàn đa nền tảng)."""
+        ce = self.gen_expr(arg) if arg is not None else None
+        # bool tường minh -> in true/false
+        if key == "b":
+            if ce is not None:
+                return "%s", f"(({ce}) ? \"true\" : \"false\")"
+            return "%s", None
+        # tự suy luận theo kiểu đối số
+        if key in ("", "v"):
+            gt = self.gtype_of(arg) if arg is not None else T.UNKNOWN
+            spec, is_bool = T.printf_spec(gt)
+            if ce is None:
+                return spec, None
+            if is_bool:
+                return spec, f"(({ce}) ? \"true\" : \"false\")"
+            cast = self._spec_cast(spec)
+            return spec, (f"({cast})({ce})" if cast else ce)
+        # specifier tường minh
+        if key in self.SPEC_MAP:
+            spec, cast = self.SPEC_MAP[key]
+            if ce is None:
+                return spec, None
+            return spec, (f"({cast})({ce})" if cast else ce)
+        # key lạ -> coi như tự suy luận
+        gt = self.gtype_of(arg) if arg is not None else T.UNKNOWN
+        spec, is_bool = T.printf_spec(gt)
+        if ce is None:
+            return spec, None
+        if is_bool:
+            return spec, f"(({ce}) ? \"true\" : \"false\")"
+        cast = self._spec_cast(spec)
+        return spec, (f"({cast})({ce})" if cast else ce)
+
+    @staticmethod
+    def _spec_cast(spec):
+        """Kiểu C cần ép cho một specifier do printf_spec sinh ra."""
+        return {
+            "%d": "int", "%u": "unsigned",
+            "%lld": "long long", "%llu": "unsigned long long",
+            "%g": "double", "%c": "int", "%p": "void*",
+        }.get(spec)   # %s -> None (không ép)
+
+    def build_format(self, raw, value_args, newline=False):
         """Sinh chuỗi định dạng C + danh sách biểu thức C tương ứng.
         Placeholder rỗng {} => tự suy ra theo kiểu của tham số."""
         result = []
@@ -452,51 +748,59 @@ class Codegen:
                 key = raw[i + 1:j]
                 arg = value_args[ai] if ai < len(value_args) else None
                 ai += 1
-                if key == "" or key == "v":
-                    gt = self.gtype_of(arg) if arg is not None else T.UNKNOWN
-                    spec, is_bool = T.printf_spec(gt)
-                    if is_bool and arg is not None:
-                        c_args.append(f"(({self.gen_expr(arg)}) ? \"true\" : \"false\")")
-                    elif arg is not None:
-                        c_args.append(self.gen_expr(arg))
-                    result.append(spec)
-                else:
-                    spec = self.SPEC_MAP.get(key, "%d")
-                    if key == "b" and arg is not None:
-                        c_args.append(f"(({self.gen_expr(arg)}) ? \"true\" : \"false\")")
-                    elif arg is not None:
-                        c_args.append(self.gen_expr(arg))
-                    result.append(spec)
+                spec, carg = self._fmt_placeholder(key, arg)
+                result.append(spec)
+                if carg is not None:
+                    c_args.append(carg)
                 i = j + 1
             elif ch == "%":
                 result.append("%%"); i += 1
             else:
                 result.append(ch); i += 1
+        if newline:
+            result.append("\n")
         return self.c_string("".join(result)), c_args
 
     def gen_struct_lit(self, e: A.StructLit):
+        if not e.fields:
+            return f"(({e.name}){{0}})"   # struct rỗng / khởi tạo zero
         parts = [f".{name} = {self.gen_expr(val)}" for name, val in e.fields]
         return f"(({e.name}){{ {', '.join(parts)} }})"
 
     # ---------- literal helpers ----------
+    # Escape cố định cho byte điều khiển. Dùng escape BÁT PHÂN cho byte còn lại
+    # vì \xNN của C *tham lam* (nuốt mọi chữ số hex theo sau) -> "\x1b" + "A"
+    # sẽ thành một giá trị; \NNN bát phân tối đa 3 chữ số nên an toàn.
+    _ESC_TABLE = {
+        ord("\n"): "\\n", ord("\t"): "\\t", ord("\r"): "\\r",
+        ord('"'): '\\"', ord("\\"): "\\\\", ord("\a"): "\\a",
+        ord("\b"): "\\b", ord("\f"): "\\f", ord("\v"): "\\v",
+    }
+
     def c_string(self, s: str) -> str:
         out = ['"']
-        for ch in s:
-            out.append(self._esc(ch))
+        data = s.encode("utf-8")          # Unicode -> byte UTF-8 (C string là byte)
+        for i, b in enumerate(data):
+            if b in self._ESC_TABLE:
+                out.append(self._ESC_TABLE[b])
+            elif 32 <= b < 127:
+                out.append(chr(b))
+            else:
+                # bát phân 3 chữ số: không bị nuốt bởi ký tự kế tiếp
+                out.append(f"\\{b:03o}")
         out.append('"')
         return "".join(out)
 
-    def _esc(self, ch):
-        table = {"\n": "\\n", "\t": "\\t", "\r": "\\r", '"': '\\"',
-                 "\\": "\\\\", "\0": "\\0", "\a": "\\a", "\b": "\\b",
-                 "\f": "\\f", "\v": "\\v"}
-        if ch in table:
-            return table[ch]
-        if ord(ch) < 32:
-            return f"\\x{ord(ch):02x}"
-        return ch
-
     def c_char(self, ch: str) -> str:
-        m = {"\n": "\\n", "\t": "\\t", "\r": "\\r", "\0": "\\0",
-             "'": "\\'", "\\": "\\\\"}
-        return f"'{m.get(ch, ch)}'"
+        b = ch.encode("utf-8")
+        if len(b) > 1:
+            # ký tự ngoài ASCII: trả về điểm mã (char trong G là 1 byte/đơn vị)
+            return str(ord(ch))
+        v = b[0]
+        special = {ord("\n"): "\\n", ord("\t"): "\\t", ord("\r"): "\\r",
+                   0: "\\0", ord("'"): "\\'", ord("\\"): "\\\\"}
+        if v in special:
+            return f"'{special[v]}'"
+        if 32 <= v < 127:
+            return f"'{chr(v)}'"
+        return f"'\\{v:03o}'"
