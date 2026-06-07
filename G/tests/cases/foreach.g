@@ -41,5 +41,27 @@ fn main() -> int {
         }
     }
     println("tích chéo = {}", s)
+
+    // duyệt từng HÀNG của mảng 2 chiều (mỗi phần tử lại là mảng)
+    let grid: [2][3]int = [[1, 2, 3], [4, 5, 6]]
+    let mut g2: int = 0
+    for row in grid {
+        for x in row {
+            g2 += x
+        }
+    }
+    println("tổng 2D = {}", g2)
+
+    // duyệt mảng 3 chiều
+    let cube: [2][2][2]int = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]
+    let mut g3: int = 0
+    for plane in cube {
+        for row in plane {
+            for x in row {
+                g3 += x
+            }
+        }
+    }
+    println("tổng 3D = {}", g3)
     return 0
 }

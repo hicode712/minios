@@ -224,13 +224,18 @@ class Parser:
         while self.accept("op", "*"):
             ptr += 1
         # Mảng (có thể nhiều chiều): [N][M]T | []T | [N]T
+        # N là literal nguyên HOẶC tên hằng (vd '[CAP]int') — checker sẽ fold.
         dims = []
         while self.is_op("["):
             self.advance()
             if self.is_op("]"):
                 dims.append("dyn")        # []T : con trỏ động
+            elif self.check("int"):
+                dims.append(int(self.advance().value, 0))
+            elif self.check("id"):
+                dims.append(self.advance().value)   # tên hằng (string) -> fold sau
             else:
-                dims.append(int(self.expect("int").value, 0))
+                self.error("cỡ mảng phải là số nguyên hoặc tên hằng")
             self.expect("op", "]")
         name = self.expect("id").value
         ty = A.Type(name, ptr=ptr, **self.pos_of(t))
@@ -362,19 +367,34 @@ class Parser:
                 pats = None
             else:
                 # parse_binary(4): dừng trước '|' (prec 3) để '|' làm dấu phân tách pattern
-                pats = [self.parse_binary(4)]
+                pats = [self.parse_match_pattern()]
                 while self.accept("op", "|"):
-                    pats.append(self.parse_binary(4))
+                    pats.append(self.parse_match_pattern())
+            # Guard tuỳ chọn (kiểu Rust): 'pattern if <điều kiện> =>'. Cấm struct
+            # literal trần trong điều kiện để '{' sau đó là thân nhánh.
+            guard = None
+            if self.accept("kw", "if"):
+                guard = self.parse_cond()
             self.expect("op", "=>")
             if self.is_op("{"):
                 body = self.parse_block()
             else:
                 body = [self.parse_stmt()]
-            arms.append((pats, body))
+            arms.append((pats, guard, body))
             self.accept("op", ",")
             self.skip_semis()
         self.expect("op", "}")
         return A.Match(subject, arms, **self.pos_of(t))
+
+    def parse_match_pattern(self):
+        """Một pattern trong match: biểu thức đơn, hoặc khoảng lo..hi / lo..=hi."""
+        lo = self.parse_binary(4)
+        t = self.cur()
+        inclusive = self.accept("op", "..=")
+        if inclusive or self.accept("op", ".."):
+            hi = self.parse_binary(4)
+            return A.RangePat(lo, hi, bool(inclusive), t.line, t.col)
+        return lo
 
     def parse_asm(self) -> A.Asm:
         self.expect("kw", "asm")

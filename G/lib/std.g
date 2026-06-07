@@ -124,6 +124,41 @@ fn str_len(s: str) -> usize {
     return strlen(s)
 }
 
+// ---- Chuỗi nâng cao (runtime g_runtime.h; bản cấp phát heap -> nhớ g_free) ----
+extern fn g_str_dup(s: str) -> str
+extern fn g_str_concat(a: str, b: str) -> str
+extern fn g_substr(s: str, start: isize, len: isize) -> str
+extern fn g_str_eq(a: str, b: str) -> bool
+extern fn g_str_index(hay: str, needle: str) -> isize
+extern fn g_str_contains(hay: str, needle: str) -> bool
+extern fn g_str_starts_with(s: str, pre: str) -> bool
+extern fn g_str_ends_with(s: str, suf: str) -> bool
+extern fn g_parse_int(s: str) -> i64
+extern fn g_parse_float(s: str) -> f64
+extern fn g_int_to_str(v: i64) -> str
+
+// Nối hai chuỗi -> chuỗi mới trên heap (nhớ g_free)
+fn str_concat(a: str, b: str) -> str { return g_str_concat(a, b) }
+
+// Cắt chuỗi con an toàn (chỉ số/độ dài tự kẹp về biên)
+fn substr(s: str, start: int, len: int) -> str {
+    return g_substr(s, start as isize, len as isize)
+}
+
+// Chuỗi a có chứa b không?
+fn str_contains(hay: str, needle: str) -> bool { return g_str_contains(hay, needle) }
+
+// Chuỗi bắt đầu/kết thúc bằng tiền tố/hậu tố?
+fn starts_with(s: str, pre: str) -> bool { return g_str_starts_with(s, pre) }
+fn ends_with(s: str, suf: str) -> bool { return g_str_ends_with(s, suf) }
+
+// Phân tích số nguyên/thực từ chuỗi (lỗi -> 0)
+fn parse_int(s: str) -> i64 { return g_parse_int(s) }
+fn parse_float(s: str) -> f64 { return g_parse_float(s) }
+
+// Chuyển số nguyên thành chuỗi mới (heap; nhớ g_free)
+fn int_to_str(v: i64) -> str { return g_int_to_str(v) }
+
 // ---- Số học bổ sung ----
 
 // Luỹ thừa modulo: (base^exp) mod m — nhanh, tránh tràn cho số vừa phải

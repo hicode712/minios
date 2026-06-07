@@ -153,6 +153,15 @@ class Match:
 
 
 @dataclass
+class RangePat:            # pattern khoảng trong match: lo..hi | lo..=hi
+    lo: object
+    hi: object
+    inclusive: bool = False
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
 class Defer:
     stmt: object
 
