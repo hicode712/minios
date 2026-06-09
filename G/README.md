@@ -1,6 +1,6 @@
 # Ngôn ngữ lập trình G
 
-**G** là một ngôn ngữ lập trình biên dịch (compiled), hệ thống (systems), kết hợp tinh hoa của **5 ngôn ngữ** — với **type-checker**, **suy luận kiểu**, **method (impl)**, **module**, **thư viện chuẩn** và **chẩn đoán lỗi đẹp**.
+**G** là một ngôn ngữ lập trình biên dịch (compiled), hệ thống (systems), kết hợp tinh hoa của **5 ngôn ngữ** — với **type-checker**, **suy luận kiểu**, **method (impl)**, **con trỏ hàm**, **module**, **thư viện chuẩn** và **chẩn đoán lỗi đẹp**.
 
 | Ảnh hưởng | Đóng góp cho G |
 |-----------|----------------|
@@ -91,6 +91,17 @@ match dir {                 // match enum phủ hết variant: KHÔNG cần '_'
 ```
 Khoảng dùng được cho cả `char`: `'a'..='z' => { ... }`.
 
+**Guard `if` và binding (kiểu Rust):** một định danh trần *bắt* giá trị subject
+vào tên mới, và `if <điều kiện>` lọc thêm — nhánh **rớt xuống** nhánh kế khi guard sai:
+```g
+match n {
+    x if x < 0   => { return "âm" }        // binding 'x' + guard
+    0            => { return "không" }
+    x if x > 100 => { return "lớn" }
+    x            => { return "thường" }     // binding mặc định, dùng được 'x'
+}
+```
+
 ### `struct`, `enum`, và `impl` (method)
 ```g
 struct Rect { w: int, h: int }
@@ -121,7 +132,42 @@ g_free(buf)
 ```g
 let nums: [5]int = [10, 20, 30, 40, 50]
 for i in 0..len(nums) { ... }    // len() dùng được cho mảng tĩnh
+
+const CAP: int = 8
+let buf: [CAP]int = ...          // cỡ = tên hằng
+let pad: [CAP + 1]int = ...      // cỡ = BIỂU THỨC HẰNG ([N+1], [2*M], [CAP/2]...)
+let grid: [3][CAP]int = ...      // nhiều chiều với chiều biểu thức hằng
+
+let ptrs: [3]*int = [&a, &b, &c] // MẢNG CÁC CON TRỎ ([N]*T, khác '*[N]T')
 ```
+
+### Con trỏ hàm (hàm bậc cao)
+Kiểu `fn(P1, P2, ...) -> R` cho phép truyền/lưu/trả về hàm — nền tảng cho callback,
+map/filter/reduce, bảng điều phối:
+```g
+fn add(a: int, b: int) -> int { return a + b }
+fn mul(a: int, b: int) -> int { return a * b }
+fn sqr(x: int) -> int { return x * x }
+fn inc(x: int) -> int { return x + 1 }
+
+let f: fn(int, int) -> int = add        // biến con trỏ hàm
+println("{}", f(3, 4))                   // 7
+
+let table: [2]fn(int) -> int = [sqr, inc]       // mảng con trỏ hàm
+
+// nhận con trỏ hàm làm tham số (hàm bậc cao)
+fn apply(a: *int, n: int, g: fn(int) -> int) {
+    for i in 0..n { a[i] = g(a[i]) }
+}
+
+// trả về con trỏ hàm
+fn pick(op: int) -> fn(int, int) -> int {
+    if op == 0 { return add }
+    return mul
+}
+```
+`std` cung cấp sẵn `map_into · filter_into · fold · count_if · any · all · find_first`.
+So sánh được với `null`; in `{}` ra địa chỉ (`%p`). (Chưa có closure bắt biến.)
 
 ### `defer` (Zig) — chạy khi rời hàm theo thứ tự LIFO
 ```g
@@ -167,8 +213,16 @@ comptime fn square(n: int) -> int { return n * n }
 > Compiler **kiểm tra số placeholder khớp số đối số** *và* **khớp kiểu với
 > specifier** (vd `{s}` cho số, `{d}` cho float đều báo lỗi).
 
+**`format(...)` (kiểu Zig `std.fmt`)** — dựng một **chuỗi mới trên heap** với đúng
+cú pháp định dạng như trên (đối số được đánh giá đúng *một lần*); nhớ `g_free`:
+```g
+let s = format("[{d:05}] {s} ≈ {f:.2}", 42, "pi", 3.14159)  // "[00042] pi ≈ 3.14"
+println("{s}", s)
+g_free(s)
+```
+
 ### Builtins
-`len(x)` · `assert(cond[, msg])` · `panic(msg)` · `unreachable([msg])` · `todo([msg])` · `min(a,b)` · `max(a,b)` · `abs(x)` · `clamp(x,lo,hi)` · `g_alloc(T,n)` · `g_realloc(p,T,n)` · `g_free(p)` · `sizeof(T)`.
+`len(x)` · `assert(cond[, msg])` · `panic(msg)` · `unreachable([msg])` · `todo([msg])` · `min(a,b)` · `max(a,b)` · `abs(x)` · `clamp(x,lo,hi)` · `format(fmt, ...)` · `g_alloc(T,n)` · `g_realloc(p,T,n)` · `g_free(p)` · `sizeof(T)` · `sizeof(expr)`.
 
 `unreachable()`/`todo()` không bao giờ trả về (như `panic`) nên thoả mãn phân
 tích "mọi nhánh đều return" — tiện cho nhánh mặc định hoặc hàm chưa hoàn thiện.
@@ -179,9 +233,11 @@ import std            // nạp lib/std.g
 import "helpers.g"    // nạp file cùng thư mục
 ```
 `lib/std.g` cung cấp:
-- **Số học:** `gcd lcm ipow is_prime factorial sign is_even is_odd isqrt fib powmod max3 min3 popcount`
-- **Mảng:** `sum_slice swap_int swap_at bubble_sort binary_search max_subarray`
-- **Chuỗi:** `streq str_len str_concat substr str_contains starts_with ends_with parse_int parse_float int_to_str`
+- **Số học:** `gcd lcm ipow is_prime factorial sign is_even is_odd isqrt fib powmod max3 min3 popcount sum_digits count_digits reverse_int is_palindrome_int`
+- **Toán f64 (libm):** `sqrt cbrt pow floor ceil round trunc fabs fmod sin cos tan atan2 exp log log2 log10 hypot lerp clampf deg2rad rad2deg` (+ hằng `G_PI`, `G_E`)
+- **Mảng:** `sum_slice swap_int swap_at bubble_sort binary_search max_subarray fill array_copy reverse array_max array_min index_of contains count_val is_sorted insertion_sort`
+- **Bậc cao (con trỏ hàm):** `map_into filter_into fold count_if any all find_first`
+- **Chuỗi:** `streq str_len str_concat substr str_contains starts_with ends_with parse_int parse_float int_to_str str_rev to_upper to_lower str_repeat count_char str_index`
 
 > Các hàm chuỗi trả chuỗi mới (vd `str_concat`, `substr`, `int_to_str`) cấp phát
 > trên heap — nhớ `g_free` khi dùng xong.
@@ -219,7 +275,7 @@ G/
 │   └── driver.py           # pipeline + module + chẩn đoán + gọi cc
 ├── runtime/g_runtime.h     # runtime (g_alloc, g_panic, ...)
 ├── lib/std.g               # thư viện chuẩn (viết bằng G)
-├── examples/               # hello, showcase, fib, sieve, oop, features
+├── examples/               # hello, showcase, fib, sieve, oop, features, list, matrix, higher_order
 └── tests/
     ├── run_tests.sh        # bộ test (so sánh output; --bless để cập nhật)
     ├── cases/              # test case riêng (chạy & so output)
@@ -259,10 +315,21 @@ let x = a +
 
 ## Giới hạn hiện tại
 
-- `match` so khớp bằng `==`/`strcmp`/khoảng (chưa destructuring struct/enum dữ liệu).
+- `match` so khớp bằng `==`/`strcmp`/khoảng + guard `if` (chưa destructuring struct/enum dữ liệu).
 - `asm` là *basic asm* GCC (chưa ràng buộc toán tử `%0/%1`).
 - Chưa có generic, trait, ownership/borrow-checker đầy đủ.
-- Cỡ mảng phải là literal nguyên (chưa hằng biểu thức `[N+1]`).
-- Chưa có con trỏ hàm / closure.
+- Có **con trỏ hàm** (`fn(T)->R`) nhưng **chưa có closure** bắt biến môi trường.
+- Cỡ mảng là biểu thức **hằng** (chưa cỡ động lúc chạy — dùng `g_alloc`).
 
 Một nền tảng vững để mở rộng tiếp. 🚀
+
+## Mới trong 0.3.0
+
+- 🐛 **Sửa crash:** `match` có nhánh *binding + guard* (vd `x if x>0 =>`) trước đây
+  làm đổ trình biên dịch — nay hạ bậc bằng `if + goto` đúng ngữ nghĩa "nhánh đầu thắng",
+  guard sai thì *rớt xuống* nhánh kế.
+- ✨ **Con trỏ hàm** `fn(P...)->R`: biến, tham số, trả về, mảng, trường struct, hàm bậc cao.
+- ✨ **`format(...)`**: dựng chuỗi trên heap kiểu Zig.
+- ✨ **Cỡ mảng là biểu thức hằng** `[N+1]`, `[2*M]`, `[CAP/2]` + `sizeof` fold đúng.
+- ✨ **Mảng con trỏ** `[N]*T`.
+- 📚 **Thư viện chuẩn mở rộng:** toán libm, tiện ích mảng/số nguyên/chuỗi, và bộ hàm bậc cao.

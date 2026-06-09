@@ -20,7 +20,7 @@ class CheckError(Exception):
         self.file = file
 
 
-BUILTINS = {"print", "println", "eprint", "eprintln", "printf",
+BUILTINS = {"print", "println", "eprint", "eprintln", "printf", "format",
             "len", "assert", "panic", "min", "max", "abs", "clamp",
             "g_alloc", "g_free", "g_realloc", "unreachable", "todo"}
 
@@ -400,30 +400,38 @@ class Checker:
     def resolve(self, ty: A.Type) -> T.GType:
         if ty is None:
             return T.UNKNOWN
-        base = ty.name
-        if base in T.PRIMITIVES:
-            g = T.PRIMITIVES[base]
-        elif base in self.structs:
-            g = T.GType("struct", name=base)
-        elif base in self.enums:
-            g = T.GType("enum", name=base)
-        else:
-            sug = suggest(base, self.type_names)
-            msg = f"kiểu chưa biết: '{base}'"
-            if sug:
-                msg += f" — có phải '{sug}'?"
-            raise CheckError(msg, ty.line, ty.col, self.cur_file)
-        # Mảng nhiều chiều: bọc từ chiều TRONG ra NGOÀI để [N][M]T = array(N, array(M, T)).
+        # ----- chiều mảng: fold về số nguyên & ghi lại vào node (cho codegen) -----
+        # Bọc từ chiều TRONG ra NGOÀI: [N][M]T = array(N, array(M, T)).
         dims = ty.dims if ty.dims is not None else (
             [ty.array] if ty.array is not None else [])
         dims = [self._fold_dim(d, ty) for d in dims]
-        # Ghi đè lại vào node cú pháp để codegen (đọc thẳng ty.dims/ty.array) thấy
-        # giá trị đã fold (số nguyên), không còn tên hằng tượng trưng.
         if ty.dims is not None:
             ty.dims = dims
             ty.array = dims[0] if dims else None
         elif ty.array is not None and dims:
             ty.array = dims[0]
+        # ----- kiểu cơ sở -----
+        if getattr(ty, "is_fn", False):
+            pts = tuple(self.resolve(p) for p in (ty.fn_params or []))
+            rt = self.resolve(ty.fn_ret) if ty.fn_ret is not None else T.VOID
+            g = T.GType("func", params=pts, ret=rt)
+        else:
+            base = ty.name
+            if base in T.PRIMITIVES:
+                g = T.PRIMITIVES[base]
+            elif base in self.structs:
+                g = T.GType("struct", name=base)
+            elif base in self.enums:
+                g = T.GType("enum", name=base)
+            else:
+                sug = suggest(base, self.type_names)
+                msg = f"kiểu chưa biết: '{base}'"
+                if sug:
+                    msg += f" — có phải '{sug}'?"
+                raise CheckError(msg, ty.line, ty.col, self.cur_file)
+        # con trỏ-phần-tử ([N]*T) -> bọc mảng (trong->ngoài) -> con trỏ ngoài (*[N]T)
+        for _ in range(getattr(ty, "elem_ptr", 0)):
+            g = T.ptr_of(g)
         for d in reversed(dims):
             g = T.array_of(g, d)
         for _ in range(ty.ptr):
@@ -431,20 +439,30 @@ class Checker:
         return g
 
     def _fold_dim(self, d, ty):
-        """Chuyển một chiều mảng tượng trưng (tên hằng) thành số nguyên.
-        Số / 'dyn' giữ nguyên. Tên không phải hằng nguyên -> lỗi rõ ràng."""
-        if not isinstance(d, str) or d == "dyn":
+        """Chuyển một chiều mảng thành số nguyên dương. Chấp nhận: số, tên hằng,
+        hoặc biểu thức hằng (literal/tên hằng/phép toán giữa hằng). 'dyn' giữ
+        nguyên. Không fold được hoặc không dương -> lỗi rõ ràng."""
+        if d == "dyn":
             return d
-        v = getattr(self, "const_ints", {}).get(d)
-        if v is None:
-            raise CheckError(
-                f"cỡ mảng '{d}' phải là hằng số nguyên đã biết "
-                f"(const/let bất biến gán giá trị hằng)", ty.line, ty.col,
-                self.cur_file)
+        if isinstance(d, int):
+            v = d
+        elif isinstance(d, str):   # tên hằng trần (đường cũ, giữ tương thích)
+            v = getattr(self, "const_ints", {}).get(d)
+            if v is None:
+                raise CheckError(
+                    f"cỡ mảng '{d}' phải là hằng số nguyên đã biết "
+                    f"(const/let bất biến gán giá trị hằng)", ty.line, ty.col,
+                    self.cur_file)
+        else:                      # nút biểu thức AST: '[N+1]', '[2*CAP]'...
+            v = self._fold_const_int(d)
+            if v is None:
+                raise CheckError(
+                    "cỡ mảng phải là biểu thức hằng số nguyên (literal, tên hằng, "
+                    "hoặc phép toán giữa các hằng đã biết)", ty.line, ty.col,
+                    self.cur_file)
         if v <= 0:
             raise CheckError(
-                f"cỡ mảng '{d}' = {v} phải là số dương", ty.line, ty.col,
-                self.cur_file)
+                f"cỡ mảng = {v} phải là số dương", ty.line, ty.col, self.cur_file)
         return v
 
     # ---------- scope ----------
@@ -956,6 +974,11 @@ class Checker:
             self.infer(e.expr)
             return self.resolve(e.type)
         if isinstance(e, A.SizeOf):
+            # Fold chiều mảng tượng trưng/biểu thức khi base là KIỂU thật (kể cả
+            # kiểu hàm) — để 'sizeof([CAP+1]int)' thành hằng số biên dịch. Còn
+            # 'sizeof(biến)' (name là tên biến) thì để codegen tự lo.
+            if getattr(e.type, "is_fn", False) or e.type.name in self.type_names:
+                self.resolve(e.type)
             return T.USIZE
         if isinstance(e, A.SizeOfExpr):
             self.infer(e.expr)
@@ -1043,9 +1066,9 @@ class Checker:
             return True
         if a.kind == "bool" and b.kind == "bool":
             return True
-        # con trỏ so với con trỏ / null
-        ap = a.kind in ("ptr", "str", "null") or self._is_dyn_array(a)
-        bp = b.kind in ("ptr", "str", "null") or self._is_dyn_array(b)
+        # con trỏ so với con trỏ / null (con trỏ hàm cũng là con trỏ)
+        ap = a.kind in ("ptr", "str", "null", "func") or self._is_dyn_array(a)
+        bp = b.kind in ("ptr", "str", "null", "func") or self._is_dyn_array(b)
         if ap and bp:
             return True
         if a.kind == "enum" and b.kind == "enum":
@@ -1217,6 +1240,16 @@ class Checker:
                         f"'{self.tyname(pt)}' nhưng nhận '{self.tyname(at)}'", e)
             return fdef.ret
         if ft.kind == "func":
+            # Gọi qua một GIÁ TRỊ con trỏ hàm (biến/tham số/trường kiểu fn(...)->R).
+            if len(e.args) != len(ft.params):
+                self.err(
+                    f"con trỏ hàm cần {len(ft.params)} tham số nhưng nhận "
+                    f"{len(e.args)}", e)
+            for i, (at, pt) in enumerate(zip(arg_types, ft.params)):
+                if not self.assignable(pt, at):
+                    self.err(
+                        f"tham số {i + 1} (qua con trỏ hàm) cần "
+                        f"'{self.tyname(pt)}' nhưng nhận '{self.tyname(at)}'", e)
             return ft.ret
         return T.UNKNOWN
 
@@ -1319,14 +1352,20 @@ class Checker:
                     self.err(
                         f"len() cần mảng tĩnh hoặc chuỗi, nhận '{self.tyname(at)}'", e)
             return T.USIZE
-        if name in ("print", "println", "eprint", "eprintln"):
+        if name in ("print", "println", "eprint", "eprintln", "format"):
             arg_ts = [self.infer(a) for a in e.args]
+            # 'format' BẮT BUỘC có chuỗi định dạng literal đầu tiên (vì luôn dựng
+            # chuỗi kết quả); print thì cho phép in trực tiếp một giá trị.
+            if name == "format" and (not e.args
+                                     or not isinstance(e.args[0], A.StrLit)):
+                self.err("format(\"...\", ...): tham số đầu phải là chuỗi định dạng "
+                         "literal", e)
             value_ts = arg_ts[1:] if (e.args and isinstance(e.args[0], A.StrLit)) else arg_ts
             for at in value_ts:
                 if at.kind in ("struct", "void") or self._is_static_array(at):
                     self.err(
-                        f"không thể in trực tiếp giá trị kiểu '{self.tyname(at)}' "
-                        f"(in từng trường/phần tử)", e)
+                        f"không thể định dạng trực tiếp giá trị kiểu "
+                        f"'{self.tyname(at)}' (dùng từng trường/phần tử)", e)
             if e.args and isinstance(e.args[0], A.StrLit):
                 keys = extract_placeholders(e.args[0].value)
                 want = len(keys)
@@ -1338,7 +1377,7 @@ class Checker:
                 # Khớp specifier tường minh với kiểu đối số (bắt UB của printf).
                 for key, at in zip(keys, value_ts):
                     self._check_fmt_spec(key, at, e)
-            return T.VOID
+            return T.STR if name == "format" else T.VOID
         if name == "assert":
             if not e.args:
                 self.err("assert(cond[, msg]) cần ít nhất 1 tham số", e)

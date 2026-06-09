@@ -223,22 +223,42 @@ class Parser:
         ptr = 0
         while self.accept("op", "*"):
             ptr += 1
-        # Mảng (có thể nhiều chiều): [N][M]T | []T | [N]T
-        # N là literal nguyên HOẶC tên hằng (vd '[CAP]int') — checker sẽ fold.
+        # Mảng (có thể nhiều chiều): [N][M]T | []T | [N]T | [N+1]T
+        # Mỗi chiều: rỗng (=> []T động), hoặc một BIỂU THỨC HẰNG (literal / tên
+        # hằng / phép toán giữa các hằng, vd '[CAP*2+1]') — checker sẽ fold.
         dims = []
         while self.is_op("["):
             self.advance()
             if self.is_op("]"):
                 dims.append("dyn")        # []T : con trỏ động
-            elif self.check("int"):
-                dims.append(int(self.advance().value, 0))
-            elif self.check("id"):
-                dims.append(self.advance().value)   # tên hằng (string) -> fold sau
             else:
-                self.error("cỡ mảng phải là số nguyên hoặc tên hằng")
+                saved = self.no_struct_lit
+                self.no_struct_lit = True
+                szexpr = self.parse_expr()
+                self.no_struct_lit = saved
+                dims.append(int(szexpr.value, 0)
+                            if isinstance(szexpr, A.IntLit) else szexpr)
             self.expect("op", "]")
-        name = self.expect("id").value
-        ty = A.Type(name, ptr=ptr, **self.pos_of(t))
+        # Con trỏ trên PHẦN TỬ: '[N]*T' = mảng các con trỏ (khác '*[N]T').
+        elem_ptr = 0
+        while self.accept("op", "*"):
+            elem_ptr += 1
+        # Kiểu con trỏ hàm: 'fn(P1, P2, ...) -> R' (R tuỳ chọn; mặc định void).
+        if self.is_kw("fn"):
+            self.advance()
+            self.expect("op", "(")
+            fparams = []
+            while not self.is_op(")"):
+                fparams.append(self.parse_type())
+                if not self.accept("op", ","):
+                    break
+            self.expect("op", ")")
+            fret = self.parse_type() if self.accept("op", "->") else None
+            ty = A.Type("fn", ptr=ptr, elem_ptr=elem_ptr, is_fn=True,
+                        fn_params=fparams, fn_ret=fret, **self.pos_of(t))
+        else:
+            name = self.expect("id").value
+            ty = A.Type(name, ptr=ptr, elem_ptr=elem_ptr, **self.pos_of(t))
         if dims:
             ty.dims = dims
             ty.array = dims[0]            # chiều ngoài cùng (giữ tương thích)

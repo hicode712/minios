@@ -126,6 +126,63 @@ static inline const char* g_int_to_str(int64_t v) {
     return g_str_dup(buf);
 }
 
+/* Đảo ngược chuỗi -> chuỗi mới (heap). */
+static inline const char* g_str_rev(const char* s) {
+    if (!s) s = "";
+    size_t n = strlen(s);
+    char* p = (char*)malloc(n + 1);
+    if (!p) return NULL;
+    for (size_t i = 0; i < n; i++) p[i] = s[n - 1 - i];
+    p[n] = '\0';
+    return p;
+}
+
+/* Chuyển sang CHỮ HOA / chữ thường (ASCII) -> chuỗi mới (heap). */
+static inline const char* g_str_upper(const char* s) {
+    if (!s) s = "";
+    size_t n = strlen(s);
+    char* p = (char*)malloc(n + 1);
+    if (!p) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        p[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+    }
+    p[n] = '\0';
+    return p;
+}
+static inline const char* g_str_lower(const char* s) {
+    if (!s) s = "";
+    size_t n = strlen(s);
+    char* p = (char*)malloc(n + 1);
+    if (!p) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        p[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    p[n] = '\0';
+    return p;
+}
+
+/* Lặp chuỗi 's' đúng 'k' lần -> chuỗi mới (heap). k<=0 -> chuỗi rỗng. */
+static inline const char* g_str_repeat(const char* s, ptrdiff_t k) {
+    if (!s) s = "";
+    if (k < 0) k = 0;
+    size_t n = strlen(s);
+    char* p = (char*)malloc(n * (size_t)k + 1);
+    if (!p) return NULL;
+    for (ptrdiff_t i = 0; i < k; i++) memcpy(p + (size_t)i * n, s, n);
+    p[n * (size_t)k] = '\0';
+    return p;
+}
+
+/* Đếm số lần ký tự 'c' xuất hiện trong chuỗi. */
+static inline ptrdiff_t g_str_count(const char* s, char c) {
+    if (!s) return 0;
+    ptrdiff_t cnt = 0;
+    for (; *s; s++) if (*s == c) cnt++;
+    return cnt;
+}
+
 /* ---- giá trị nhỏ nhất/lớn nhất theo kiểu (tiện cho comptime) ---- */
 #define G_I8_MAX   127
 #define G_I8_MIN   (-128)
