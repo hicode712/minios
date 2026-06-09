@@ -11,6 +11,16 @@ from . import ast_nodes as A
 from . import types as T
 
 
+class _CTReturn(Exception):
+    """Tín hiệu 'return' trong bộ thông dịch comptime (mang theo giá trị nguyên)."""
+    def __init__(self, value):
+        self.value = value
+
+
+class _CTAbort(Exception):
+    """Bộ thông dịch comptime gặp cấu trúc không gấp được -> coi như không-hằng."""
+
+
 class CheckError(Exception):
     def __init__(self, msg, line=0, col=0, file=None):
         super().__init__(msg)
@@ -155,7 +165,10 @@ class Checker:
                 break
 
     def _fold_const_int(self, e):
-        """Tính giá trị nguyên của biểu thức hằng (hoặc None nếu không thể)."""
+        """Tính giá trị nguyên của biểu thức hằng (hoặc None nếu không thể).
+        Hỗ trợ: literal, char, bool, tên hằng/biến thể enum, toán tử một/hai ngôi
+        (kể cả so sánh & luận lý), ternary, ép kiểu, và LỜI GỌI hàm comptime/thuần
+        (gấp qua một bộ thông dịch có giới hạn — xem _eval_const_call)."""
         if isinstance(e, A.IntLit):
             try:
                 return int(e.value, 0)
@@ -163,30 +176,233 @@ class Checker:
                 return None
         if isinstance(e, A.CharLit):
             return ord(e.value) if len(e.value) == 1 else None
+        if isinstance(e, A.BoolLit):
+            return 1 if e.value else 0
         if isinstance(e, A.Ident):
-            return self.const_ints.get(e.name)
+            v = self.const_ints.get(e.name)
+            if v is not None:
+                return v
+            if e.name in self.enum_of_variant:
+                return self.enums.get(self.enum_of_variant[e.name], {}).get(e.name)
+            return None
         if isinstance(e, A.Unary):
             v = self._fold_const_int(e.operand)
             if v is None:
                 return None
-            return {"-": -v, "~": ~v, "+": v}.get(e.op)
+            return {"-": -v, "~": ~v, "+": v, "!": (0 if v else 1)}.get(e.op)
         if isinstance(e, A.Binary):
+            if e.op in ("&&", "||"):    # đoản mạch
+                a = self._fold_const_int(e.left)
+                if a is None:
+                    return None
+                if e.op == "&&" and not a:
+                    return 0
+                if e.op == "||" and a:
+                    return 1
+                b = self._fold_const_int(e.right)
+                return None if b is None else (1 if b else 0)
             a = self._fold_const_int(e.left)
             b = self._fold_const_int(e.right)
             if a is None or b is None:
                 return None
-            try:
-                return {
-                    "+": a + b, "-": a - b, "*": a * b,
-                    "/": a // b if b else None, "%": a % b if b else None,
-                    "<<": a << b, ">>": a >> b,
-                    "&": a & b, "|": a | b, "^": a ^ b,
-                }.get(e.op)
-            except (ValueError, ZeroDivisionError):
+            return self._ct_binop(e.op, a, b)
+        if isinstance(e, A.Ternary):
+            c = self._fold_const_int(e.cond)
+            if c is None:
                 return None
+            return self._fold_const_int(e.then if c else e.els)
         if isinstance(e, A.Cast):
             return self._fold_const_int(e.expr)
+        if isinstance(e, A.Call):
+            return self._eval_const_call(e)
         return None
+
+    # ---------- bộ thông dịch comptime (gấp lời gọi hàm lúc biên dịch) ----------
+    @staticmethod
+    def _ct_binop(op, a, b):
+        """Phép toán hai ngôi trên số nguyên với ngữ nghĩa C (chia/lấy dư cắt về 0).
+        Trả về None nếu không hợp lệ (chia 0, dịch âm) — caller coi là không-hằng."""
+        if op == "/" or op == "%":
+            if b == 0:
+                return None
+            q = abs(a) // abs(b)
+            if (a < 0) != (b < 0):
+                q = -q
+            return q if op == "/" else a - q * b
+        if op in ("<<", ">>"):
+            if b < 0:
+                return None
+            return a << b if op == "<<" else a >> b
+        return {
+            "+": a + b, "-": a - b, "*": a * b,
+            "&": a & b, "|": a | b, "^": a ^ b,
+            "==": 1 if a == b else 0, "!=": 1 if a != b else 0,
+            "<": 1 if a < b else 0, ">": 1 if a > b else 0,
+            "<=": 1 if a <= b else 0, ">=": 1 if a >= b else 0,
+            "&&": 1 if (a and b) else 0, "||": 1 if (a or b) else 0,
+        }.get(op)
+
+    def _eval_const_call(self, e: A.Call):
+        """Gấp một lời gọi hàm thành hằng nguyên (nếu được). Dùng cho cỡ mảng
+        '[sq(3)]int', giá trị enum, sizeof... Đánh giá thân hàm qua một bộ thông
+        dịch CÓ GIỚI HẠN (ngân sách bước + độ sâu) trên tập con nguyên của G:
+        let/assign/if/while/for/return + số học. Bất kỳ thứ gì ngoài tập đó ->
+        None (không-hằng), an toàn rơi về chẩn đoán lỗi cũ."""
+        funcs = getattr(self, "_all_funcs", None)
+        if not funcs or not isinstance(e.func, A.Ident):
+            return None
+        argvals = []
+        for a in e.args:
+            v = self._fold_const_int(a)
+            if v is None:
+                return None
+            argvals.append(v)
+        try:
+            return self._ct_call(e.func.name, argvals, [200000], 0)
+        except (_CTAbort, _CTReturn):
+            return None
+
+    def _ct_call(self, name, argvals, budget, depth):
+        if depth > 256:
+            raise _CTAbort()
+        if name in ("min", "max", "abs", "clamp"):
+            return self._ct_builtin(name, argvals)
+        fn = self._all_funcs.get(name)
+        if fn is None or fn.body is None or len(argvals) != len(fn.params):
+            raise _CTAbort()
+        env = {p.name: v for p, v in zip(fn.params, argvals)}
+        try:
+            self._ct_body(fn.body, env, budget, depth + 1)
+        except _CTReturn as r:
+            if r.value is None:
+                raise _CTAbort()
+            return r.value
+        raise _CTAbort()   # rơi khỏi thân mà không return giá trị
+
+    @staticmethod
+    def _ct_builtin(name, argvals):
+        if name == "abs" and len(argvals) == 1:
+            return abs(argvals[0])
+        if name in ("min", "max") and len(argvals) == 2:
+            return (min if name == "min" else max)(argvals[0], argvals[1])
+        if name == "clamp" and len(argvals) == 3:
+            x, lo, hi = argvals
+            return lo if x < lo else (hi if x > hi else x)
+        raise _CTAbort()
+
+    def _ct_body(self, body, env, budget, depth):
+        for st in body:
+            self._ct_stmt(st, env, budget, depth)
+
+    def _ct_tick(self, budget):
+        budget[0] -= 1
+        if budget[0] <= 0:
+            raise _CTAbort()
+
+    def _ct_stmt(self, st, env, budget, depth):
+        self._ct_tick(budget)
+        if isinstance(st, A.Let):
+            env[st.name] = (self._ct_expr(st.value, env, budget, depth)
+                            if st.value is not None else 0)
+        elif isinstance(st, A.Assign):
+            if not isinstance(st.target, A.Ident):
+                raise _CTAbort()
+            rhs = self._ct_expr(st.value, env, budget, depth)
+            if st.op == "=":
+                env[st.target.name] = rhs
+            else:
+                cur = env.get(st.target.name)
+                if cur is None:
+                    raise _CTAbort()
+                r = self._ct_binop(st.op[:-1], cur, rhs)
+                if r is None:
+                    raise _CTAbort()
+                env[st.target.name] = r
+        elif isinstance(st, A.Return):
+            raise _CTReturn(self._ct_expr(st.value, env, budget, depth)
+                            if st.value is not None else None)
+        elif isinstance(st, A.If):
+            if self._ct_expr(st.cond, env, budget, depth):
+                self._ct_body(st.then, env, budget, depth)
+            elif st.els is not None:
+                self._ct_body(st.els, env, budget, depth)
+        elif isinstance(st, A.While):
+            while self._ct_expr(st.cond, env, budget, depth):
+                self._ct_tick(budget)
+                self._ct_body(st.body, env, budget, depth)
+        elif isinstance(st, A.For):
+            start = self._ct_expr(st.start, env, budget, depth)
+            end = self._ct_expr(st.end, env, budget, depth)
+            step = (self._ct_expr(st.step, env, budget, depth)
+                    if st.step is not None else 1)
+            if step == 0:
+                raise _CTAbort()
+            i = start
+            while (i <= end if st.inclusive else i < end) if step > 0 \
+                    else (i >= end if st.inclusive else i > end):
+                self._ct_tick(budget)
+                env[st.var] = i
+                self._ct_body(st.body, env, budget, depth)
+                i += step
+        elif isinstance(st, A.Block):
+            self._ct_body(st.body, env, budget, depth)
+        elif isinstance(st, A.ExprStmt):
+            self._ct_expr(st.expr, env, budget, depth)
+        else:
+            raise _CTAbort()   # match/defer/asm/... : không gấp được
+
+    def _ct_expr(self, e, env, budget, depth):
+        self._ct_tick(budget)
+        if isinstance(e, A.IntLit):
+            try:
+                return int(e.value, 0)
+            except ValueError:
+                raise _CTAbort()
+        if isinstance(e, A.CharLit):
+            if len(e.value) == 1:
+                return ord(e.value)
+            raise _CTAbort()
+        if isinstance(e, A.BoolLit):
+            return 1 if e.value else 0
+        if isinstance(e, A.Ident):
+            if e.name in env:
+                return env[e.name]
+            if e.name in self.const_ints:
+                return self.const_ints[e.name]
+            if e.name in self.enum_of_variant:
+                return self.enums[self.enum_of_variant[e.name]][e.name]
+            raise _CTAbort()
+        if isinstance(e, A.Unary):
+            v = self._ct_expr(e.operand, env, budget, depth)
+            if e.op == "-":
+                return -v
+            if e.op == "~":
+                return ~v
+            if e.op == "+":
+                return v
+            if e.op == "!":
+                return 0 if v else 1
+            raise _CTAbort()
+        if isinstance(e, A.Binary):
+            a = self._ct_expr(e.left, env, budget, depth)
+            if e.op == "&&":
+                return 1 if (a and self._ct_expr(e.right, env, budget, depth)) else 0
+            if e.op == "||":
+                return 1 if (a or self._ct_expr(e.right, env, budget, depth)) else 0
+            b = self._ct_expr(e.right, env, budget, depth)
+            r = self._ct_binop(e.op, a, b)
+            if r is None:
+                raise _CTAbort()
+            return r
+        if isinstance(e, A.Ternary):
+            c = self._ct_expr(e.cond, env, budget, depth)
+            return self._ct_expr(e.then if c else e.els, env, budget, depth)
+        if isinstance(e, A.Cast):
+            return self._ct_expr(e.expr, env, budget, depth)
+        if isinstance(e, A.Call) and isinstance(e.func, A.Ident):
+            argvals = [self._ct_expr(a, env, budget, depth) for a in e.args]
+            return self._ct_call(e.func.name, argvals, budget, depth)
+        raise _CTAbort()
 
     # ---------- thu thập khai báo ----------
     def collect_types(self):
