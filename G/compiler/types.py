@@ -35,8 +35,12 @@ class GType:
             return f"[{sz}]{self.elem}"
         if self.kind in ("struct", "enum"):
             return self.name
-        if self.kind == "int":
+        if self.kind in ("int", "float") and self.name:
             return self.name
+        if self.kind == "func":
+            ps = ", ".join(str(p) for p in self.params)
+            r = str(self.ret) if self.ret is not None else "void"
+            return f"fn({ps}) -> {r}"
         return self.kind
 
 

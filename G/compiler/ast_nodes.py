@@ -339,6 +339,7 @@ class SizeOf:
     type: Type
     line: int = 0
     col: int = 0
+    align: bool = False     # True nếu là 'alignof' (sinh _Alignof thay vì sizeof)
 
 
 @dataclass

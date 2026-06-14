@@ -523,10 +523,15 @@ class Codegen:
 
         init_c = self.gen_expr(st.value) if st.value is not None else None
         if st.type is not None:
-            self.w(self.c_decl(name, st.type, init_c, const=const) + ";")
+            if init_c is None:
+                # Không có initializer: zero-init '= {0}' (an toàn, tất định kiểu Go)
+                # thay vì để bộ nhớ rác (UB). '{0}' hợp lệ cho vô hướng/mảng/struct.
+                self.w(self.c_decl(name, st.type, "{0}", const=const) + ";")
+            else:
+                self.w(self.c_decl(name, st.type, init_c, const=const) + ";")
         else:
             if init_c is None:
-                self.w(f"int {name};")
+                self.w(f"int {name} = 0;")
             else:
                 q = "const " if const else ""
                 self.w(f"{q}__auto_type {name} = {init_c};")
@@ -812,6 +817,15 @@ class Codegen:
                 rt = self.gtype_of(e.right)
                 if lt.kind == "float" or rt.kind == "float":
                     return f"fmod({lc}, {rc})"
+            # So sánh BẰNG NỘI DUNG cho chuỗi: 'a == b' / 'a != b' trên str dùng
+            # g_str_eq (an toàn null) thay vì so con trỏ — nhất quán với 'match'
+            # chuỗi (strcmp) và tránh bẫy so địa chỉ literal.
+            if e.op in ("==", "!="):
+                lt = self.gtype_of(e.left)
+                rt = self.gtype_of(e.right)
+                if self._is_stringy(lt) and self._is_stringy(rt):
+                    eq = f"g_str_eq({lc}, {rc})"
+                    return eq if e.op == "==" else f"(!{eq})"
             return f"({lc} {e.op} {rc})"
         if isinstance(e, A.Unary):
             return f"({e.op}{self.gen_expr(e.operand)})"
@@ -830,7 +844,8 @@ class Codegen:
         if isinstance(e, A.SizeOf):
             # Kích thước phải gồm CẢ các chiều mảng: sizeof([10]int) = 10*sizeof(int).
             # c_decl với tên rỗng sinh "int [10]" / "int (*)[3]" hợp lệ trong sizeof.
-            return f"sizeof({self.c_decl('', e.type)})"
+            op = "_Alignof" if getattr(e, "align", False) else "sizeof"
+            return f"{op}({self.c_decl('', e.type)})"
         if isinstance(e, A.SizeOfExpr):
             return f"sizeof({self.gen_expr(e.expr)})"
         if isinstance(e, A.ArrayLit):
@@ -847,6 +862,16 @@ class Codegen:
         if isinstance(e, (A.Ident, A.FieldAccess, A.Index, A.StructLit)):
             return True
         return isinstance(e, A.Unary) and e.op == "*"
+
+    @staticmethod
+    def _is_stringy(t) -> bool:
+        """Kiểu có phải 'chuỗi C' không (str hoặc *char)? Dùng để so sánh '=='/
+        '!=' theo NỘI DUNG (g_str_eq) thay vì so địa chỉ con trỏ. KHÔNG tính
+        'null' để 's == null' vẫn là phép kiểm tra con trỏ NULL thông thường."""
+        if t is None:
+            return False
+        return t.kind == "str" or (
+            t.kind == "ptr" and t.elem is not None and t.elem.kind == "char")
 
     def gen_call(self, e: A.Call):
         # method call (đã phân giải trong checker)
@@ -886,6 +911,18 @@ class Codegen:
                 loc = self.gen_expr(e.args[0]) if e.args else self.c_string(
                     f"{name}() tại {getattr(e, 'line', 0)}")
                 return f"g_{name}({loc})"
+            if name == "typeof":
+                # Hằng chuỗi: tên kiểu suy luận của đối số (không đánh giá đối số).
+                gt = self.gtype_of(e.args[0]) if e.args else T.UNKNOWN
+                return self.c_string(str(gt))
+            if name == "swap":
+                # Lấy ĐỊA CHỈ hai ô nhớ một lần rồi tráo qua biến tạm — an toàn cả
+                # khi đối số có tác dụng phụ (vd swap(a[i()], a[j()])).
+                a = self.gen_expr(e.args[0])
+                b = self.gen_expr(e.args[1])
+                pa, pb, tv = self.tmp("_gpa"), self.tmp("_gpb"), self.tmp("_gtv")
+                return (f"({{ __auto_type {pa} = &({a}); __auto_type {pb} = &({b}); "
+                        f"__auto_type {tv} = *{pa}; *{pa} = *{pb}; *{pb} = {tv}; }})")
             if name in ("min", "max"):
                 op = "<" if name == "min" else ">"
                 a, b = e.args[0], e.args[1]

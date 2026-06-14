@@ -221,8 +221,22 @@ println("{s}", s)
 g_free(s)
 ```
 
+### Đọc đầu vào (stdin) — chương trình tương tác
+`import std` rồi dùng:
+```g
+let n = read_int()            // đọc một số nguyên (i64); 0 nếu thất bại/EOF
+let x = read_float()          // đọc một số thực (f64)
+let line = read_line()        // đọc một dòng -> chuỗi mới trên heap; null khi EOF
+if line != null { println("{s}", line); g_free(line) }
+while !at_eof() { ... }        // lặp tới khi hết đầu vào
+```
+
 ### Builtins
-`len(x)` · `assert(cond[, msg])` · `panic(msg)` · `unreachable([msg])` · `todo([msg])` · `min(a,b)` · `max(a,b)` · `abs(x)` · `clamp(x,lo,hi)` · `format(fmt, ...)` · `g_alloc(T,n)` · `g_realloc(p,T,n)` · `g_free(p)` · `sizeof(T)` · `sizeof(expr)`.
+`len(x)` · `assert(cond[, msg])` · `panic(msg)` · `unreachable([msg])` · `todo([msg])` · `min(a,b)` · `max(a,b)` · `abs(x)` · `clamp(x,lo,hi)` · `swap(a,b)` · `typeof(x)` · `format(fmt, ...)` · `g_alloc(T,n)` · `g_realloc(p,T,n)` · `g_free(p)` · `sizeof(T)` · `sizeof(expr)` · `alignof(T)`.
+
+- `swap(a, b)` tráo nội dung hai **ô nhớ** cùng kiểu (đánh giá địa chỉ đúng *một lần* — an toàn với `swap(a[i()], a[j()])`); hai ô phải khả biến.
+- `typeof(x)` trả về **chuỗi** tên kiểu suy luận (`"i64"`, `"f64"`, `"str"`, `"fn(int) -> int"`...) — hằng lúc biên dịch, không đánh giá `x`.
+- `alignof(T)` cho **độ căn lề** của kiểu (bổ trợ `sizeof`) — `alignof(i64)`, `alignof(*Node)`, `alignof([4]int)`.
 
 `unreachable()`/`todo()` không bao giờ trả về (như `panic`) nên thoả mãn phân
 tích "mọi nhánh đều return" — tiện cho nhánh mặc định hoặc hàm chưa hoàn thiện.
@@ -233,11 +247,15 @@ import std            // nạp lib/std.g
 import "helpers.g"    // nạp file cùng thư mục
 ```
 `lib/std.g` cung cấp:
-- **Số học:** `gcd lcm ipow is_prime factorial sign is_even is_odd isqrt fib powmod max3 min3 popcount sum_digits count_digits reverse_int is_palindrome_int`
-- **Toán f64 (libm):** `sqrt cbrt pow floor ceil round trunc fabs fmod sin cos tan atan2 exp log log2 log10 hypot lerp clampf deg2rad rad2deg` (+ hằng `G_PI`, `G_E`)
-- **Mảng:** `sum_slice swap_int swap_at bubble_sort binary_search max_subarray fill array_copy reverse array_max array_min index_of contains count_val is_sorted insertion_sort`
+- **Số học:** `gcd lcm gcd3 ipow is_prime factorial sign is_even is_odd isqrt fib powmod max3 min3 popcount sum_digits count_digits reverse_int is_palindrome_int mod_floor is_power_of_two next_power_of_two leading_zeros trailing_zeros sum_to num_divisors is_perfect totient`
+- **Tổ hợp & thống kê:** `ncr npr variance stddev median_sorted` (+ `average`)
+- **Toán f64 (libm):** `sqrt cbrt pow floor ceil round trunc fabs fmod sin cos tan atan2 exp log log2 log10 hypot lerp clampf deg2rad rad2deg sigmoid factorial_f sq_f cube_f approx_eq` (+ hằng `G_PI`, `G_E`, `G_TAU`, `G_PHI`)
+- **Mảng:** `sum_slice swap_int swap_at bubble_sort insertion_sort quicksort binary_search lower_bound upper_bound max_subarray fill array_copy reverse reverse_range array_max array_min min_index max_index index_of contains count_val is_sorted array_sum array_product array_eq rotate_left dedup_sorted prefix_sum clamp_array`
 - **Bậc cao (con trỏ hàm):** `map_into filter_into fold count_if any all find_first`
-- **Chuỗi:** `streq str_len str_concat substr str_contains starts_with ends_with parse_int parse_float int_to_str str_rev to_upper to_lower str_repeat count_char str_index`
+- **Chuỗi:** `streq str_len str_concat substr str_contains starts_with ends_with parse_int parse_float int_to_str str_rev to_upper to_lower str_repeat count_char str_index trim replace_char`
+- **Ký tự (ASCII):** `is_digit is_upper is_lower is_alpha is_alnum is_space to_upper_char to_lower_char digit_to_int hex_val`
+- **Đầu vào (stdin):** `read_line read_int read_float at_eof`
+- **Ngẫu nhiên (xorshift64):** `rng_seed rng_seed_time rand_u64 rand_range rand_int rand_float coin_flip shuffle`
 
 > Các hàm chuỗi trả chuỗi mới (vd `str_concat`, `substr`, `int_to_str`) cấp phát
 > trên heap — nhớ `g_free` khi dùng xong.
@@ -308,6 +326,12 @@ let x = a +
   tên (kèm va chạm tên biến thể enum giữa các enum) — thay vì rò lỗi C khó hiểu.
 - **Gán không hợp lệ:** cấm gán cả mảng tĩnh bằng `=`, và gán kết quả hàm `void`
   cho biến.
+- **So sánh dây chuyền:** bắt `a < b < c` (vô nghĩa toán học trong C/G) và gợi ý `&&`.
+- **So sánh enum khác loại:** `EnumA == EnumB` (gần như luôn là lỗi logic) bị từ chối.
+- **Lấy địa chỉ/giải tham chiếu sai:** `&<giá trị tạm>` và `*<không phải con trỏ>`
+  báo lỗi G sạch thay vì rò lỗi C khó hiểu.
+- **Chia cho hằng 0:** `x / 0`, `x % (3-3)` (mẫu số gấp được thành 0) bị bắt sớm.
+- **`print` mơ hồ:** nhiều đối số mà thiếu chuỗi định dạng (sẽ bỏ bớt đối số) bị từ chối.
 
 > **Ngữ nghĩa vòng lặp:** `for i in a..b` lượng giá cận `b` (và `step`) **đúng
 > một lần** khi vào vòng (giống Rust) — đổi `b` trong thân không làm dài thêm
@@ -322,6 +346,28 @@ let x = a +
 - Cỡ mảng là biểu thức **hằng** (chưa cỡ động lúc chạy — dùng `g_alloc`).
 
 Một nền tảng vững để mở rộng tiếp. 🚀
+
+## Mới trong 0.4.0
+
+- 🐛 **Sửa lỗi nghiêm trọng:** `==`/`!=` trên chuỗi (so theo nội dung) trước đây làm
+  **đổ trình sinh mã** (`_is_stringy` chưa định nghĩa) — nay hoạt động và có test.
+- ⌨️ **Đọc đầu vào (stdin):** `read_line` · `read_int` · `read_float` · `at_eof` —
+  lần đầu G chạy được chương trình **tương tác** (trước đây hoàn toàn không có input).
+- ✨ **`typeof(x)`** (chuỗi tên kiểu), **`swap(a, b)`** (tráo ô nhớ an toàn),
+  **`alignof(T)`** (độ căn lề, bổ trợ `sizeof`).
+- ✨ **`==`/`!=` trên chuỗi so theo NỘI DUNG** (`g_str_eq`, an toàn null) — nhất quán
+  với `match` chuỗi, hết bẫy so địa chỉ literal.
+- 🔧 **`as` ràng buộc đúng như Rust** (lỏng hơn tiền tố): `&x as *T` = `(&x) as *T`,
+  `-x as int` = `(-x) as int`.
+- 🔧 **Số học con trỏ** `p += n` / `p -= n` (di chuyển con trỏ `n` phần tử).
+- 🛡️ **Chẩn đoán mới:** so sánh dây chuyền, so enum khác loại, `&<rvalue>`,
+  `*<không phải con trỏ>`, chia cho hằng 0, `print` nhiều đối số thiếu format.
+- 📚 **Thư viện chuẩn mở rộng mạnh:** thống kê (`variance`/`stddev`/`median_sorted`),
+  tổ hợp (`ncr`/`npr`), lý thuyết số (`num_divisors`/`is_perfect`/`totient`/`sum_to`),
+  sắp xếp nhanh & tìm cận (`quicksort`/`lower_bound`/`upper_bound`), sinh số ngẫu nhiên
+  tất định (`rng_seed`/`rand_int`/`shuffle`), vị từ ký tự, và nhiều hơn nữa.
+- ✅ **Bộ test mở rộng** (57 ca) + hỗ trợ **stdin** trong `run_tests.sh`
+  (`tests/input/<tên>.txt`).
 
 ## Mới trong 0.3.0
 
